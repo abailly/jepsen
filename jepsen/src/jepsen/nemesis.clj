@@ -23,13 +23,8 @@
   reject messages from, and makes the appropriate changes. Does not heal the
   network first, so repeated calls to partition! are cumulative right now."
   [test grudge]
-  (->> grudge
-       (map (fn [[node frenemies]]
-              (future
-                (snub-nodes! test node frenemies))))
-       doall
-       (map deref)
-       dorun))
+  (c/on-nodes test (fn snub [test node]
+                     (snub-nodes! test node (get grudge node)))))
 
 (defn bisect
   "Given a sequence, cuts it in half; smaller half first."
@@ -38,8 +33,9 @@
 
 (defn split-one
   "Split one node off from the rest"
-  [coll]
-  (let [loner (rand-nth coll)]
+  ([coll]
+   (split-one (rand-nth coll) coll))
+  ([loner coll]
     [[loner] (remove (fn [x] (= x loner)) coll)]))
 
 (defn complete-grudge
@@ -182,13 +178,13 @@
 
     (invoke! [this test op]
       (assoc op :value
-                (c/on-many (:nodes test)
-                           (set-time! (+ (/ (System/currentTimeMillis) 1000)
-                                         (- (rand-int (* 2 dt)) dt))))))
+             (c/with-test-nodes test
+               (set-time! (+ (/ (System/currentTimeMillis) 1000)
+                             (- (rand-int (* 2 dt)) dt))))))
 
     (teardown! [this test]
-      (c/on-many (:nodes test)
-                 (set-time! (/ (System/currentTimeMillis) 1000))))))
+      (c/with-test-nodes test
+        (set-time! (/ (System/currentTimeMillis) 1000))))))
 
 (defn node-start-stopper
   "Takes a targeting function which, given a list of nodes, returns a single
@@ -216,7 +212,8 @@
                    :start (if-let [ns (-> test :nodes targeter util/coll)]
                             (if (compare-and-set! nodes nil ns)
                               (c/on-many ns (start! test c/*host*))
-                              (str "nemesis already disrupting " @nodes))
+                              (str "nemesis already disrupting "
+                                   (pr-str @nodes)))
                             :no-target)
                    :stop (if-let [ns @nodes]
                            (let [value (c/on-many ns (stop! test c/*host*))]

@@ -4,6 +4,7 @@
             [clojure.core.reducers :as r]
             [clojure.set :as set]
             [clojure.java.io :as io]
+            [clojure.tools.logging :refer [info warn]]
             [jepsen.util :as util]
             [jepsen.store :as store]
             [multiset.core :as multiset]
@@ -161,9 +162,9 @@
 
 (def type->color
   "Takes a type of operation (e.g. :ok) and returns a gnuplot color."
-  {:ok   3
-   :fail 1
-   :info 4})
+  {:ok   ['rgb "#81BFFC"]
+   :info ['rgb "#FFA400"]
+   :fail ['rgb "#FF1E90"]})
 
 (defn nemesis-intervals
   "Given a history, constructs a sequence of [start-time, stop-time] intervals
@@ -222,7 +223,7 @@
   [test history opts]
   (let [history     (util/history->latencies history)
         datasets    (invokes-by-f-type history)
-        fs          (sort (keys datasets))
+        fs          (util/polysort (keys datasets))
         fs->points  (fs->points fs)
         output-path (.getCanonicalPath (store/path! test (:subdirectory opts)
                                                     "latency-raw.png"))]
@@ -236,7 +237,7 @@
                                 'with        'points
                                 'linetype    (type->color t)
                                 'pointtype   (fs->points f)
-                                'title       (str (name f) " "
+                                'title       (str (util/name+ f) " "
                                                   (name t))]))]])
       (for [f fs, t types]
         (map latency-point (get-in datasets [f t]))))
@@ -258,7 +259,7 @@
                                   (map latency-point)
                                   (latencies->quantiles dt qs)
                                   (vector f)))))
-        fs          (sort (keys datasets))
+        fs          (util/polysort (keys datasets))
         fs->points  (fs->points fs)
         qs->colors  (qs->colors qs)
         output-path (.getCanonicalPath
@@ -274,7 +275,7 @@
                                 'with        'linespoints
                                 'linetype    (qs->colors q)
                                 'pointtype   (fs->points f)
-                                'title       (str (name f) " "
+                                'title       (str (util/name+ f) " "
                                                   q)]))]])
       (for [f fs, q qs]
         (get-in datasets [f q])))
@@ -288,6 +289,8 @@
           [[:set :title (str (:name test) " rate")]]
           '[[set ylabel "Throughput (hz)"]]))
 
+
+
 (defn rate-graph!
   "Writes a plot of operation rate by their completion times."
   [test history opts]
@@ -296,6 +299,8 @@
         t-max       (->> history (r/map :time) (reduce max 0) util/nanos->secs)
         datasets    (->> history
                          (r/remove op/invoke?)
+                         ; Don't graph nemeses
+                         (r/filter (comp integer? :process))
                          ; Compute rates
                          (reduce (fn [m op]
                                    (update-in m [(:f op)
@@ -305,7 +310,7 @@
                                                                 (:time op)))]
                                               #(+ td (or % 0))))
                                  {}))
-        fs          (sort (keys datasets))
+        fs          (util/polysort (keys datasets))
         fs->points  (fs->points fs)
         output-path (.getCanonicalPath (store/path! test (:subdirectory opts)
                                                     "rate.png"))]
@@ -319,7 +324,7 @@
                                 'with         'linespoints
                                 'linetype     (type->color t)
                                 'pointtype    (fs->points f)
-                                'title        (str (name f) " "
+                                'title        (str (util/name+ f) " "
                                                    (name t))]))]])
       (for [f fs, t types]
         (let [m (get-in datasets [f t])]

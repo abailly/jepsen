@@ -4,7 +4,7 @@
             [clojure.string :as str]
             [hiccup.core :as h]
             [knossos.history :as history]
-            [jepsen.util :as util]
+            [jepsen.util :as util :refer [name+]]
             [jepsen.store :as store]
             [jepsen.checker :as checker]))
 
@@ -24,10 +24,10 @@
   (str ".ops        { position: absolute; }\n"
        ".op         { position: absolute;
                       padding:  2px; }\n"
-       ".op.invoke  { background: #C1DEFF; }\n"
-       ".op.ok      { background: #B7FFB7; }\n"
-       ".op.fail    { background: #FFD4D5; }\n"
-       ".op.info    { background: #FEFFC1; }\n"))
+       ".op.invoke  { background: #eeeeee; }\n"
+       ".op.ok      { background: #6DB6FE; }\n"
+       ".op.info    { background: #FFAA26; }\n"
+       ".op.fail    { background: #FEB5DA; }\n"))
 
 (defn pairs
   "Pairs up ops from each process in a history. Yields a lazy sequence of [info]
@@ -72,10 +72,11 @@
 
                                true
                                (assoc s :height height)))
-           :title (when stop (str (long (util/nanos->ms
-                                          (- (:time stop) (:time start))))
-                                  " ms"))}
-     (str (:process op) " " (name (:f op)) " " (:value start)
+           :title (str (when stop (str (long (util/nanos->ms
+                                               (- (:time stop) (:time start))))
+                                       " ms\n"))
+                       (pr-str (:error op)))}
+     (str (:process op) " " (name+ (:f op)) " " (:value start)
           (when (not= (:value start) (:value stop))
             (str "<br />" (:value stop))))]))
 
@@ -92,7 +93,6 @@
   []
   (reify checker/Checker
     (check [this test model history opts]
-      (prn "checking")
       (->> (h/html [:html
                     [:head
                      [:style stylesheet]]

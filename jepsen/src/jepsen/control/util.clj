@@ -3,7 +3,7 @@
   (:require [jepsen.control :refer :all]
             [jepsen.util :refer [meh]]
             [clojure.java.io :refer [file]]
-            [clojure.tools.logging :refer [info]]
+            [clojure.tools.logging :refer [info warn]]
             [clojure.string :as str]))
 
 (def tmp-dir-base "Where should we put temporary files?" "/tmp/jepsen")
@@ -52,66 +52,96 @@
 (defn wget!
   "Downloads a string URL and returns the filename as a string. Skips if the
   file already exists."
-  [url]
-  (let [filename (.getName (file url))]
-    (when-not (exists? filename)
-      (exec :wget
-            :--tries 20
-            :--waitretry 60
-            :--retry-connrefused
-            :--dns-timeout 60
-            :--connect-timeout 60
-            :--read-timeout 60
-            url))
-    filename))
+  ([url]
+   (wget! url false))
+  ([url force?]
+   (let [filename (.getName (file url))]
+     (when force?
+       (exec :rm :-f filename))
+     (when (not (exists? filename))
+       (exec :wget
+             :--tries 20
+             :--waitretry 60
+             :--retry-connrefused
+             :--dns-timeout 60
+             :--connect-timeout 60
+             :--read-timeout 60
+             url))
+     filename)))
 
-(defn install-tarball!
+(defn install-archive!
   "Gets the given tarball URL, caching it in /tmp/jepsen/, and extracts its
   sole top-level directory to the given dest directory. Deletes
-  current contents of dest. Returns dest."
-  [node url dest]
-  (let [local-file (nth (re-find #"file://(.+)" url) 1)
-        file       (or local-file
-                       (do (exec :mkdir :-p tmp-dir-base)
-                           (cd tmp-dir-base
-                               (expand-path (wget! url)))))
-        tmpdir     (tmp-dir!)
-        dest       (expand-path dest)]
-    ; Clean up old dest
-    (exec :rm :-rf dest)
-    (try
-      (cd tmpdir
-          ; Extract tarball to tmpdir
-          (exec :tar :xf file)
+  current contents of dest. Supports both zip files and tarballs, compressed or
+  raw. Returns dest.
 
-          ; Get tarball root paths
-          (let [roots (ls)]
-            (assert (pos? (count roots)) "Tarball contained no files")
-            (assert (= 1  (count roots))
-                    (str "Tarball contained multiple top-level files: "
-                         (pr-str roots)))
+  Standard practice for release tarballs is to include a single directory,
+  often named something like foolib-1.2.3-amd64, with files inside it. If only
+  a single directory is present, its *contents* will be moved to dest, so
+  foolib-1.2.3-amd64/my.file becomes dest/my.file. If the tarball includes
+  multiple files, those files are moved to dest, so my.file becomes
+  dest/my.file."
+  ([url dest]
+   (install-archive! url dest false))
+  ([url dest force?]
+   (let [local-file (nth (re-find #"file://(.+)" url) 1)
+         file       (or local-file
+                        (do (exec :mkdir :-p tmp-dir-base)
+                            (cd tmp-dir-base
+                                (expand-path (wget! url force?)))))
+         tmpdir     (tmp-dir!)
+         dest       (expand-path dest)]
 
-            ; Move root to dest
-            (exec :mv (first roots) dest)))
-      (catch RuntimeException e
-        (condp re-find (.getMessage e)
-          #"tar: Unexpected EOF"
-          (if local-file
-            ; Nothing we can do to recover here
-            (throw (RuntimeException.
-                     (str "Local tarball " local-file " on node " (name node)
-                          " is corrupt: unexpected EOF.")))
-            (do (info "Retrying corrupt tarball download")
-                (exec :rm :-rf file)
-                (install-tarball! node url dest)))
+     ; Clean up old dest and make sure parent directory is ready
+     (exec :rm :-rf dest)
+     (let [parent (exec :dirname dest)]
+       (exec :mkdir :-p parent))
 
-          ; Throw by default
-          (throw e)))
-      (finally
-        ; Clean up tmpdir
-        (exec :rm :-rf tmpdir))))
-  dest)
+     (try
+       (cd tmpdir
+           ; Extract archive to tmpdir
+           (if (re-find #".*\.zip$" file)
+             (exec :unzip file)
+             (exec :tar :xf file))
 
+           ; Get archive root paths
+           (let [roots (ls)]
+             (assert (pos? (count roots)) "Archive contained no files")
+
+             (if (= 1 (count roots))
+               ; Move root's contents to dest
+               (exec :mv (first roots) dest)
+
+               ; Move all roots to dest
+               (exec :mv tmpdir dest))))
+
+       (catch RuntimeException e
+         (condp re-find (.getMessage e)
+           #"tar: Unexpected EOF"
+           (if local-file
+             ; Nothing we can do to recover here
+             (throw (RuntimeException.
+                      (str "Local archive " local-file " on node "
+                           *host*
+                           " is corrupt: unexpected EOF.")))
+             (do (info "Retrying corrupt archive download")
+                 (exec :rm :-rf file)
+                 (install-archive! url dest force?)))
+
+           ; Throw by default
+           (throw e)))
+
+       (finally
+         ; Clean up tmpdir
+         (exec :rm :-rf tmpdir))))
+   dest))
+
+(defn install-tarball!
+  ([node url dest]
+   (install-tarball! node url dest false))
+  ([node url dest force?]
+   (warn "DEPRECATED: jepsen.control.util/install-tarball! is now named jepsen.control.util/install-archive!, and the `node` argument is no longer required.")
+   (install-archive! url dest force?)))
 
 (defn ensure-user!
   "Make sure a user exists."
@@ -143,19 +173,26 @@
   "Starts a daemon process, logging stdout and stderr to the given file.
   Invokes `bin` with `args`. Options are:
 
+  :background?
+  :chdir
   :logfile
+  :make-pidfile?
+  :match-executable?
+  :match-process-name?
   :pidfile
-  :chdir"
+  :process-name"
   [opts bin & args]
   (info "starting" (.getName (file bin)))
   (apply exec :start-stop-daemon :--start
-         :--background
-         :--make-pidfile
+         (when (:background? opts true) [:--background :--no-close])
+         (when (:make-pidfile? opts true) :--make-pidfile)
+         (when (:match-executable? opts true) [:--exec bin])
+         (when (:match-process-name? opts false)
+           [:--name (:process-name opts (.getName (file bin)))])
          :--pidfile  (:pidfile opts)
          :--chdir    (:chdir opts)
-         :--no-close
          :--oknodo
-         :--exec     bin
+         :--startas  bin
          :--
          (concat args [:>> (:logfile opts) (lit "2>&1")])))
 
@@ -171,5 +208,5 @@
 
   ([cmd pidfile]
    (info "Stopping" cmd)
-   (meh (exec :killall :-9 cmd))
+   (meh (exec :killall :-9 :-w cmd))
    (meh (exec :rm :-rf pidfile))))

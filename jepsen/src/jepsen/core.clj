@@ -19,6 +19,7 @@
             [clojure.pprint :refer [pprint]]
             [knossos.core :as knossos]
             [jepsen.util :as util :refer [with-thread-name
+                                          fcatch
                                           real-pmap
                                           relative-time-nanos]]
             [jepsen.os :as os]
@@ -48,14 +49,6 @@
   [test]
   (first (:nodes test)))
 
-(defn fcatch
-  "Takes a function and returns a version of it which returns, rather than
-  throws, exceptions."
-  [f]
-  (fn wrapper [& args]
-    (try (apply f args)
-         (catch Exception e e))))
-
 (defmacro with-resources
   "Takes a four-part binding vector: a symbol to bind resources to, a function
   to start a resource, a function to stop a resource, and a sequence of
@@ -79,24 +72,14 @@
          ; Clean up resources
          (dorun (real-pmap (fcatch ~stop) ~sym))))))
 
-(defn on-nodes
-  "Given a test, evaluates (f test node) in parallel on each node, with that
-  node's SSH connection bound."
-  [test f]
-  (->> (:sessions test)
-       (real-pmap (fn [[node session]]
-                      (control/with-session node session
-                        (f test node))))
-       dorun))
-
 (defmacro with-os
   "Wraps body in OS setup and teardown."
   [test & body]
   `(try
-     (on-nodes ~test (partial os/setup! (:os ~test)))
+     (control/on-nodes ~test (partial os/setup! (:os ~test)))
      ~@body
      (finally
-       (on-nodes ~test (partial os/teardown! (:os ~test))))))
+       (control/on-nodes ~test (partial os/teardown! (:os ~test))))))
 
 (defn setup-primary!
   "Given a test, sets up the database primary, if the DB supports it."
@@ -106,16 +89,54 @@
       (control/with-session p (get-in test [:sessions p])
         (db/setup-primary! (:db test) test p)))))
 
+(defn snarf-logs!
+  "Downloads logs for a test."
+  [test]
+  ; Download logs
+  (when (satisfies? db/LogFiles (:db test))
+    (info "Snarfing log files")
+    (control/on-nodes test
+              (fn [test node]
+                (let [full-paths (db/log-files (:db test) test node)
+                      ; A map of full paths to short paths
+                      paths      (->> full-paths
+                                      (map #(str/split % #"/"))
+                                      util/drop-common-proper-prefix
+                                      (map (partial str/join "/"))
+                                      (zipmap full-paths))]
+                  (doseq [[remote local] paths]
+                    (info "downloading" remote "to" local)
+                    (try
+                      (control/download
+                        remote
+                        (.getCanonicalPath
+                          (store/path! test (name node)
+                                       ; strip leading /
+                                       (str/replace local #"^/" ""))))
+                      (catch java.io.IOException e
+                        (if (= "Pipe closed" (.getMessage e))
+                          (info remote "pipe closed")
+                          (throw e)))
+                      (catch java.lang.IllegalArgumentException e
+                        ; This is a jsch bug where the file is just being
+                        ; created
+                        (info remote "doesn't exist")))))))))
+
 (defmacro with-db
   "Wraps body in DB setup and teardown."
   [test & body]
   `(try
-     (on-nodes ~test (partial db/cycle! (:db ~test)))
+     (control/on-nodes ~test (partial db/cycle! (:db ~test)))
      (setup-primary! ~test)
 
      ~@body
+     (catch Throwable t#
+       ; Emergency log dump!
+       (snarf-logs! ~test)
+       (store/update-symlinks! ~test)
+       (throw t#))
      (finally
-       (on-nodes ~test (partial db/teardown! (:db ~test))))))
+       (control/on-nodes ~test (partial db/teardown! (:db ~test))))))
 
 (defn worker
   "Spawns a future to execute a particular process in the history."
@@ -127,6 +148,8 @@
         (loop [process process]
           ; Obtain an operation to execute
           (when-let [op (generator/op gen test process)]
+            (assert (map? op) (str "Expected an operation map from " gen
+                                   ", but got " (pr-str op) " instead."))
             (let [op (assoc op
                             :process process
                             :time    (relative-time-nanos))]
@@ -141,7 +164,12 @@
                                        (assoc :time (relative-time-nanos)))]
                     (util/log-op completion)
 
-                    ; Sanity check
+                    ; Sanity checks
+                    (let [t (:type completion)]
+                      (assert (or (= t :ok)
+                                  (= t :fail)
+                                  (= t :info))
+                              (str "Expected client/invoke! to return a map with :type :ok, :fail, or :info, but received " (pr-str completion) " instead")))
                     (assert (= (:process op) (:process completion)))
                     (assert (= (:f op)       (:f completion)))
 
@@ -185,8 +213,12 @@
         histories (:active-histories test)]
     (future
       (with-thread-name "jepsen nemesis"
+        (info "Nemesis starting")
         (loop []
           (when-let [op (generator/op gen test :nemesis)]
+            (assert (map? op) (str "Expected an operation map for nemesis from "
+                                   gen
+                                   ", but got " (pr-str op) " instead."))
             (let [op (assoc op
                             :process :nemesis
                             :time    (relative-time-nanos))]
@@ -240,39 +272,6 @@
          (client/teardown! nemesis# ~test)
          (info "Nemesis torn down")))))
 
-(defn snarf-logs!
-  "Downloads logs for a test."
-  [test]
-  ; Download logs
-  (when (satisfies? db/LogFiles (:db test))
-    (info "Snarfing log files")
-    (on-nodes test
-              (fn [test node]
-                (let [full-paths (db/log-files (:db test) test node)
-                      ; A map of full paths to short paths
-                      paths      (->> full-paths
-                                      (map #(str/split % #"/"))
-                                      util/drop-common-proper-prefix
-                                      (map (partial str/join "/"))
-                                      (zipmap full-paths))]
-                  (doseq [[remote local] paths]
-                    (info "downloading" remote "to" local)
-                    (try
-                      (control/download
-                        remote
-                        (.getCanonicalPath
-                          (store/path! test (name node)
-                                       ; strip leading /
-                                       (str/replace local #"^/" ""))))
-                      (catch java.io.IOException e
-                        (if (= "Pipe closed" (.getMessage e))
-                          (info remote "pipe closed")
-                          (throw e)))
-                      (catch java.lang.IllegalArgumentException e
-                        ; This is a jsch bug where the file is just being
-                        ; created
-                        (info remote "doesn't exist")))))))))
-
 (defn run-case!
   "Spawns nemesis and clients, runs a single test case, snarf the logs, and
   returns that case's history."
@@ -283,21 +282,20 @@
     ; Register history with test's active set.
     (swap! (:active-histories test) conj history)
 
-    ; Launch nemesis
-    (with-nemesis test
-      ; Launch clients
-      (with-resources [clients
-                       #(client/setup! (:client test) test %) ; Specialize to node
-                       #(client/teardown! % test)
-                       (if (empty? (:nodes test))
-                         ; If you've specified an empty node set, we'll still
-                         ; give you `concurrency` clients, with nil.
-                         (repeat (:concurrency test) nil)
-                         (->> test
-                              :nodes
-                              cycle
-                              (take (:concurrency test))))]
-
+    ; Launch clients
+    (with-resources [clients
+                     #(client/setup! (:client test) test %) ; Specialize to node
+                     #(client/teardown! % test)
+                     (if (empty? (:nodes test))
+                       ; If you've specified an empty node set, we'll still
+                       ; give you `concurrency` clients, with nil.
+                       (repeat (:concurrency test) nil)
+                       (->> test
+                            :nodes
+                            cycle
+                            (take (:concurrency test))))]
+      ; Launch nemesis
+      (with-nemesis test
         ; Begin workload
         (let [workers (mapv (partial worker test)
                             (iterate inc 0) ; PIDs
@@ -318,14 +316,14 @@
   "Logs info about the results of a test to stdout, and returns test."
   [test]
   (info (str
-          (if (:valid? (:results test))
-            "Everything looks good! ヽ(‘ー`)ノ"
-            "Analysis invalid! (ﾉಥ益ಥ）ﾉ ┻━┻")
-          "\n\n"
           (with-out-str
             (pprint (:results test)))
           (when (:error (:results test))
-            (str "\n\n" (:error (:results test))))))
+            (str "\n\n" (:error (:results test))))
+          "\n\n"
+          (if (:valid? (:results test))
+            "Everything looks good! ヽ(‘ー`)ノ"
+            "Analysis invalid! (ﾉಥ益ಥ）ﾉ ┻━┻")))
   test)
 
 (defn run!
@@ -348,6 +346,8 @@
   :checker    Verifies that the history is valid
   :log-files  A list of paths to logfiles/dirs which should be captured at
               the end of the test.
+  :nonserializable-keys   A collection of top-level keys in the test which
+                          shouldn't be serialized to disk.
 
   Tests proceed like so:
 
@@ -377,61 +377,60 @@
      the history
     - This generates the final report"
   [test]
-  (log-results
-    (with-thread-name "jepsen test runner"
-      (let [test (assoc test
-                        ; Initialization time
-                        :start-time (util/local-time)
+  (info "Running test:\n" (with-out-str (pprint test)))
+  (try
+    (log-results
+      (with-thread-name "jepsen test runner"
+        (let [test (assoc test
+                          ; Initialization time
+                          :start-time (util/local-time)
 
-                        ; Number of concurrent workers
-                        :concurrency (or (:concurrency test)
-                                         (count (:nodes test)))
+                          ; Number of concurrent workers
+                          :concurrency (or (:concurrency test)
+                                           (count (:nodes test)))
 
-                        ; Synchronization point for nodes
-                        :barrier (let [c (count (:nodes test))]
-                                   (if (pos? c)
-                                     (CyclicBarrier. (count (:nodes test)))
-                                     ::no-barrier))
-                        ; Currently running histories
-                        :active-histories (atom #{}))]
+                          ; Synchronization point for nodes
+                          :barrier (let [c (count (:nodes test))]
+                                     (if (pos? c)
+                                       (CyclicBarrier. (count (:nodes test)))
+                                       ::no-barrier))
+                          ; Currently running histories
+                          :active-histories (atom #{}))
+              _    (store/start-logging! test)
+              test (control/with-ssh (:ssh test)
+                     (with-resources [sessions
+                                      (bound-fn* control/session)
+                                      control/disconnect
+                                      (:nodes test)]
+                       ; Index sessions by node name and add to test
+                       (let [test (->> sessions
+                                       (map vector (:nodes test))
+                                       (into {})
+                                       (assoc test :sessions))]
+                         ; Setup
+                         (with-os test
+                           (with-db test
+                             (generator/with-threads
+                               (cons :nemesis (range (:concurrency test)))
+                               (util/with-relative-time
+                                 ; Run a single case
+                                 (let [test (assoc test :history (run-case! test))
+                                       ; Remove state
+                                       test (dissoc test
+                                                    :barrier
+                                                    :active-histories
+                                                    :sessions)]
+                                   (info "Run complete, writing")
+                                   (when (:name test) (store/save-1! test))
+                                   test))))))))
+              _ (info "Analyzing")
+              test (assoc test :results (checker/check-safe
+                                          (:checker test)
+                                          test
+                                          (:model test)
+                                          (:history test)))]
 
-        ; Open SSH conns
-        (control/with-ssh (:ssh test)
-          (with-resources [sessions
-                           (bound-fn* control/session)
-                           control/disconnect
-                           (:nodes test)]
-
-            ; Index sessions by node name and add to test
-            (let [test (->> sessions
-                            (map vector (:nodes test))
-                            (into {})
-                            (assoc test :sessions))]
-
-              ; Setup
-              (with-os test
-                (with-db test
-                  (generator/with-threads (cons :nemesis
-                                                (range (:concurrency test)))
-                    (util/with-relative-time
-                        ; Run a single case
-                        (let [test (assoc test :history (run-case! test))
-                              ; Remove state
-                              test (dissoc test
-                                           :barrier
-                                           :active-histories
-                                           :sessions)]
-
-                          (info "Run complete, writing")
-                          (when (:name test) (store/save-1! test))
-
-                          (info "Analyzing")
-                          (let [test (assoc test :results (checker/check-safe
-                                                            (:checker test)
-                                                            test
-                                                            (:model test)
-                                                            (:history test)))]
-
-                            (info "Analysis complete")
-                            (when (:name test) (store/save-2! test))
-                          test)))))))))))))
+          (info "Analysis complete")
+          (when (:name test) (store/save-2! test)))))
+    (finally
+      (store/stop-logging!))))

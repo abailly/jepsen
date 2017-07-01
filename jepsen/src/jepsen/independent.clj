@@ -7,7 +7,7 @@
   registers."
   (:require [jepsen.util :as util :refer [map-kv]]
             [jepsen.store :as store]
-            [jepsen.checker :refer [check Checker]]
+            [jepsen.checker :refer [merge-valid check-safe Checker]]
             [jepsen.generator :as gen :refer [Generator]]
             [clojure.tools.logging :refer :all]
             [clojure.core.reducers :as r]
@@ -65,9 +65,9 @@
 (defn concurrent-generator
   "Takes a positive integer n, a sequence of keys (k1 k2 ...) and a function
   (fgen k) which, when called with a key, yields a generator. Returns a
-  generator which runs n keys concurrently. Once a key's generator is
-  exhausted, it obtains a new key, constructs a new generator from key, and
-  moves on.
+  generator which runs tests on independent keys concurrently, with n threads
+  per key. Once a key's generator is exhausted, it obtains a new key,
+  constructs a new generator from key, and moves on.
 
   The nemesis does not run in subgenerators; only normal workers evaluate these
   operations.
@@ -133,28 +133,27 @@
                   ; Also assuming concurrency aligns with thread-count; not sure
                   ; how this composes when nested given the process->thread
                   ; mapping
-                  _ (assert (= (:concurrency test) thread-count))
+                  _ (assert (= (:concurrency test) thread-count)
+                            (str "Expected test :concurrency ("
+                                 (:concurrency test)
+                                 ") to be equal to number of integer threads ("
+                                 thread-count ")"))
+                  ; So, we're running groups of n threads, which means we have:
+                  group-size  n
+                  group-count (quot thread-count group-size)]
+              (assert (<= group-size thread-count)
+                      (str "With " thread-count " worker threads, this"
+                           " jepsen.concurrent/concurrent-generator cannot"
+                           " run a key with " group-size " threads concurrently."
+                           " Consider raising your test's :concurrency to at least "
+                           group-size "."))
 
-                  ; Let a "chunk" be a contiguous set of threads covering every
-                  ; node. A "group" is made up of chunks.
-                  chunk-size  (count (:nodes test))
-                  ; How many whole chunks can we run, given the set of threads?
-                  chunk-count (quot thread-count chunk-size)
-                  ; Make sure there are enough chunks to run concurrently
-                  _ (assert (<= n chunk-count)
-                            (str "With " thread-count
-                                 " worker threads and " chunk-size
-                                 " nodes, you can only run " chunk-count
-                                 " keys concurrently, but you requested " n
-                                 " concurrent keys from"
-                                 " jepsen.independent/concurrent-generator"))
-                  group-size   (* chunk-size (quot chunk-count n))
-                  group-count  (quot thread-count group-size)]
-              (assert (= thread-count (* group-size n))
+              (assert (= thread-count (* group-size group-count))
                       (str "This jepsen.independent/concurrent-generator has "
                            thread-count
                            " threads to work with, but can only use "
-                           (* group-size n) " of those threads to run " n
+                           (* group-size group-count)
+                           " of those threads to run " group-count
                            " concurrent keys with " group-size
                            " threads apiece. Consider raising or lowering the"
                            " test's :concurrency to a multiple of " group-size
@@ -265,8 +264,9 @@
                                  (let [h (subhistory k history)
                                        subdir (concat (:subdirectory opts)
                                                       [dir k])
-                                       results (check checker test model h
-                                                      {:subdirectory subdir})]
+                                       results (check-safe
+                                                 checker test model h
+                                                 {:subdirectory subdir})]
                                    ; Write analysis
                                    (store/with-out-file test [subdir
                                                               "results.edn"]
@@ -274,8 +274,8 @@
 
                                    ; Write history
                                    (store/with-out-file test [subdir
-                                                              "history.txt"]
-                                     (util/print-history h))
+                                                              "history.edn"]
+                                     (util/print-history prn h))
 
                                    ; Return results as a map
                                    [k results])))
@@ -287,6 +287,6 @@
                                       (conj! failures k)))
                                   (transient []))
                           persistent!)]
-        {:valid? (empty? failures)
+        {:valid?  (merge-valid (map :valid? (vals results)))
          :results results
          :failures failures}))))

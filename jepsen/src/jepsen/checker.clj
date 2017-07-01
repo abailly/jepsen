@@ -6,16 +6,41 @@
             [clojure.core.reducers :as r]
             [clojure.set :as set]
             [clojure.java.io :as io]
-            [jepsen.util :as util]
+            [jepsen.util :as util :refer [meh]]
             [jepsen.store :as store]
             [jepsen.checker.perf :as perf]
             [multiset.core :as multiset]
             [gnuplot.core :as g]
             [knossos [model :as model]
                      [op :as op]
+                     [competition :as competition]
                      [linear :as linear]
+                     [wgl :as wgl]
                      [history :as history]]
             [knossos.linear.report :as linear.report]))
+
+(def valid-priorities
+  "A map of :valid? values to their importance. Larger numbers are considered
+  more signficant and dominate when checkers are composed."
+  {true      0
+   false     1
+   :unknown  0.5})
+
+(defn merge-valid
+  "Merge n :valid values, yielding the one with the highest priority."
+  [valids]
+  (reduce (fn [v1 v2]
+            (let [p1 (or (valid-priorities v1)
+                         (throw (IllegalArgumentException.
+                                  (str (pr-str v1)
+                                      " is not a known valid? value"))))
+                  p2 (or (valid-priorities v2)
+                         (throw (IllegalArgumentException.
+                                  (str (pr-str v2)
+                                       " is not a known valid? value"))))]
+              (if (< p1 p2) v2 v1)))
+          true
+          valids))
 
 (defprotocol Checker
   (check [checker test model history opts]
@@ -37,40 +62,53 @@
 (defn check-safe
   "Like check, but wraps exceptions up and returns them as a map like
 
-  {:valid? nil :error \"...\"}"
+  {:valid? :unknown :error \"...\"}"
   ([checker test model history]
    (check-safe checker test model history {}))
   ([checker test model history opts]
    (try (check checker test model history opts)
         (catch Throwable t
-          {:valid? false
+          {:valid? :unknown
            :error (with-out-str (trace/print-cause-trace t))}))))
 
-(def unbridled-optimism
+(defn unbridled-optimism
   "Everything is awesoooommmmme!"
+  []
   (reify Checker
     (check [this test model history opts] {:valid? true})))
 
-(def linearizable
-  "Validates linearizability with Knossos."
-  (reify Checker
-    (check [this test model history opts]
-      (let [a (linear/analysis model history)]
-        (when-not (:valid? a)
-          (linear.report/render-analysis!
-            history a (.getCanonicalPath (store/path! test (:subdirectory opts)
-                                                      "linear.svg"))))
-        ; Writing these can take *hours* so we truncate
-        (assoc a
-               :final-paths (take 10 (:final-paths a))
-               :configs     (take 10 (:configs a)))))))
+(defn linearizable
+  "Validates linearizability with Knossos. Defaults to the competition checker,
+  but can be controlled by passing either :linear or :wgl."
+  ([]
+   (linearizable :competition))
+  ([algorithm]
+   (reify Checker
+     (check [this test model history opts]
+       (let [a ((case algorithm
+                  :competition  competition/analysis
+                  :linear       linear/analysis
+                  :wgl          wgl/analysis)
+                model history)]
+         (when-not (:valid? a)
+           (meh
+             ; Renderer can't handle really broad concurrencies yet
+             (linear.report/render-analysis!
+               history a (.getCanonicalPath
+                           (store/path! test (:subdirectory opts)
+                                        "linear.svg")))))
+         ; Writing these can take *hours* so we truncate
+         (assoc a
+                :final-paths (take 10 (:final-paths a))
+                :configs     (take 10 (:configs a))))))))
 
-(def queue
+(defn queue
   "Every dequeue must come from somewhere. Validates queue operations by
   assuming every non-failing enqueue succeeded, and only OK dequeues succeeded,
   then reducing the model with that history. Every subhistory of every queue
   should obey this property. Should probably be used with an unordered queue
   model, because we don't look for alternate orderings. O(n)."
+  []
   (reify Checker
     (check [this test model history opts]
       (let [final (->> history
@@ -86,10 +124,11 @@
           {:valid?      true
            :final-queue final})))))
 
-(def set
+(defn set
   "Given a set of :add operations followed by a final :read, verifies that
   every successfully added element is present in the read, and that the read
   contains only elements for which an add was attempted."
+  []
   (reify Checker
     (check [this test model history opts]
       (let [attempts (->> history
@@ -108,31 +147,31 @@
                           (r/map :value)
                           (reduce (fn [_ x] x) nil))]
         (if-not final-read
-          {:valid? false
-           :error  "Set was never read"})
+          {:valid? :unknown
+           :error  "Set was never read"}
 
-        (let [; The OK set is every read value which we tried to add
-              ok          (set/intersection final-read attempts)
+          (let [; The OK set is every read value which we tried to add
+                ok          (set/intersection final-read attempts)
 
-              ; Unexpected records are those we *never* attempted.
-              unexpected  (set/difference final-read attempts)
+                ; Unexpected records are those we *never* attempted.
+                unexpected  (set/difference final-read attempts)
 
-              ; Lost records are those we definitely added but weren't read
-              lost        (set/difference adds final-read)
+                ; Lost records are those we definitely added but weren't read
+                lost        (set/difference adds final-read)
 
-              ; Recovered records are those where we didn't know if the add
-              ; succeeded or not, but we found them in the final set.
-              recovered   (set/difference ok adds)]
+                ; Recovered records are those where we didn't know if the add
+                ; succeeded or not, but we found them in the final set.
+                recovered   (set/difference ok adds)]
 
-          {:valid?          (and (empty? lost) (empty? unexpected))
-           :ok              (util/integer-interval-set-str ok)
-           :lost            (util/integer-interval-set-str lost)
-           :unexpected      (util/integer-interval-set-str unexpected)
-           :recovered       (util/integer-interval-set-str recovered)
-           :ok-frac         (util/fraction (count ok) (count attempts))
-           :unexpected-frac (util/fraction (count unexpected) (count attempts))
-           :lost-frac       (util/fraction (count lost) (count attempts))
-           :recovered-frac  (util/fraction (count recovered) (count attempts))})))))
+            {:valid?          (and (empty? lost) (empty? unexpected))
+             :ok              (util/integer-interval-set-str ok)
+             :lost            (util/integer-interval-set-str lost)
+             :unexpected      (util/integer-interval-set-str unexpected)
+             :recovered       (util/integer-interval-set-str recovered)
+             :ok-frac         (util/fraction (count ok) (count attempts))
+             :unexpected-frac (util/fraction (count unexpected) (count attempts))
+             :lost-frac       (util/fraction (count lost) (count attempts))
+             :recovered-frac  (util/fraction (count recovered) (count attempts))}))))))
 
 (defn fraction
   "a/b, but if b is zero, returns unity."
@@ -141,10 +180,11 @@
            1
            (/ a b)))
 
-(def total-queue
+(defn total-queue
   "What goes in *must* come out. Verifies that every successful enqueue has a
   successful dequeue. Queues only obey this property if the history includes
   draining them completely. O(n)."
+  []
   (reify Checker
     (check [this test model history opts]
       (let [attempts (->> history
@@ -198,7 +238,7 @@
          :lost-frac       (util/fraction (count lost)       (count attempts))
          :recovered-frac  (util/fraction (count recovered)  (count attempts))}))))
 
-(def counter
+(defn counter
   "A counter starts at zero; add operations should increment it by that much,
   and reads should return the present value. This checker validates that at
   each read, the value is at greater than the sum of all :ok increments, and
@@ -216,6 +256,7 @@
    :max-absolute-error  The [lower read upper] where read falls furthest outside
    :max-relative-error  Same, but with error computed as a fraction of the mean}
   "
+  []
   (reify Checker
     (check [this test model history opts]
       (loop [history            (seq (history/complete history))
@@ -262,9 +303,9 @@
     (check [this test model history opts]
       (let [results (->> checker-map
                          (pmap (fn [[k checker]]
-                                 [k (check checker test model history opts)]))
+                                 [k (check-safe checker test model history opts)]))
                          (into {}))]
-        (assoc results :valid? (every? :valid? (vals results)))))))
+        (assoc results :valid? (merge-valid (map :valid? (vals results))))))))
 
 (defn latency-graph
   "Spits out graphs of latencies."

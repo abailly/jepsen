@@ -9,6 +9,7 @@
             [clj-time.local :as time.local]
             [clj-time.coerce :as time.coerce]
             [clj-time.format :as time.format]
+            [unilog.config :as unilog]
             [multiset.core :as multiset]
             [jepsen.util :as util])
   (:import (java.io File)
@@ -23,7 +24,13 @@
 (def base-dir "store")
 
 (def write-handlers
-  (-> {org.joda.time.DateTime
+  (-> {clojure.lang.Atom
+       {"atom" (reify WriteHandler
+                 (write [_ w a]
+                   (.writeTag    w "atom" 1)
+                   (.writeObject w @a)))}
+
+       org.joda.time.DateTime
        {"date-time" (reify WriteHandler
                       (write [_ w t]
                         (.writeTag    w "date-time" 1)
@@ -46,6 +53,13 @@
                                     (doseq [e set]
                                       (.writeObject w e))))}
 
+       clojure.lang.MapEntry
+       {"map-entry" (reify WriteHandler
+                      (write [_ w e]
+                        (.writeTag    w "map-entry" 2)
+                        (.writeObject w (key e))
+                        (.writeObject w (val e))))}
+
        multiset.core.MultiSet
        {"multiset" (reify WriteHandler
                      (write [_ w set]
@@ -57,7 +71,11 @@
       fress/inheritance-lookup))
 
 (def read-handlers
-  (-> {"date-time" (reify ReadHandler
+  (-> {"atom"      (reify ReadHandler
+                     (read [_ rdr tag component-count]
+                       (atom (.readObject rdr))))
+
+       "date-time" (reify ReadHandler
                      (read [_ rdr tag component-count]
                        (time.format/parse
                          (:basic-date-time time.local/*local-formatters*)
@@ -71,13 +89,18 @@
                                    (persistent! s))))
 
        "persistent-sorted-set" (reify ReadHandler
-                               (read [_ rdr tag component-count]
-                                 (loop [i component-count
-                                        s (sorted-set)]
-                                   (if (pos? i)
-                                     (recur (dec i)
-                                            (conj s (.readObject rdr)))
-                                     s))))
+                                 (read [_ rdr tag component-count]
+                                   (loop [i component-count
+                                          s (sorted-set)]
+                                     (if (pos? i)
+                                       (recur (dec i)
+                                              (conj s (.readObject rdr)))
+                                       s))))
+
+       "map-entry" (reify ReadHandler
+                     (read [_ rdr tag component-count]
+                       (clojure.lang.MapEntry. (.readObject rdr)
+                                               (.readObject rdr))))
 
        "multiset" (reify ReadHandler
                     (read [_ rdr tag component-count]
@@ -129,9 +152,15 @@
   [test]
   (path! test "test.fressian"))
 
-(def nonserializable-keys
-  "What keys in a test can't be serialized to disk?"
-  [:db :os :net :client :checker :nemesis :generator :model])
+(def default-nonserializable-keys
+  "What keys in a test can't be serialized to disk, by default?"
+  #{:db :os :net :client :checker :nemesis :generator :model})
+
+(defn nonserializable-keys
+  "What keys in a test can't be serialized to disk? The union of default
+  nonserializable keys, plus any in :nonserializable-keys."
+  [test]
+  (into default-nonserializable-keys (:nonserializable-keys test)))
 
 (defn load
   "Loads a specific test by name and time."
@@ -140,6 +169,15 @@
                                                     :start-time test-time}))]
     (let [in (fress/create-reader file :handlers read-handlers)]
       (fress/read-object in))))
+
+(defn load-results
+  "Loads only a results.edn by name and time."
+  [test-name test-time]
+  (with-open [file (java.io.PushbackReader.
+                     (io/reader (path {:name       test-name
+                                       :start-time test-time}
+                                      "results.edn")))]
+    (clojure.edn/read file)))
 
 (defn dir?
   "Is this a directory?"
@@ -195,17 +233,18 @@
         (into {}))))
 
 (defn update-symlinks!
-  "Creates `latest` symlinks to the given test."
+  "Creates `latest` symlinks to the given test, if a store directory exists."
   [test]
   (doseq [dest [["latest"] [(:name test) "latest"]]]
     ; did you just tell me to go fuck myself
-    (let [src  (.toPath (path test))
-          dest (.. FileSystems
-                   getDefault
-                   (getPath base-dir (into-array dest)))]
-      (Files/deleteIfExists dest)
-      (Files/createSymbolicLink dest (.relativize (.getParent dest) src)
-                                (make-array FileAttribute 0)))))
+    (when (.exists (path test))
+      (let [src  (.toPath (path test))
+            dest (.. FileSystems
+                     getDefault
+                     (getPath base-dir (into-array dest)))]
+        (Files/deleteIfExists dest)
+        (Files/createSymbolicLink dest (.relativize (.getParent dest) src)
+                                  (make-array FileAttribute 0))))))
 
 (defmacro with-out-file
   "Binds stdout to a file for the duration of body."
@@ -224,14 +263,15 @@
     (pprint (:results test))))
 
 (defn write-history!
-  "Writes out a history.txt file."
+  "Writes out history.txt and history.edn files."
   [test]
-  (util/pwrite-history! (path! test "history.txt") (:history test)))
+  (util/pwrite-history! (path! test "history.txt") (:history test))
+  (util/pwrite-history! (path! test "history.edn") prn (:history test)))
 
 (defn write-fressian!
   "Write the entire test as a .fressian file"
   [test]
-  (let [test (apply dissoc test nonserializable-keys)]
+  (let [test (apply dissoc test (nonserializable-keys test))]
     (with-open [file   (io/output-stream (fressian-file! test))]
       (let [out (fress/create-writer file :handlers write-handlers)]
         (fress/write-object out test)))))
@@ -240,8 +280,10 @@
   "Writes a history and fressian file to disk and updates latest symlinks.
   Returns test."
   [test]
-  (->> [(future (write-history! test))
-        (future (write-fressian! test))]
+  (->> [(future (util/with-thread-name "jepsen history"
+                  (write-history! test)))
+        (future (util/with-thread-name "jepsen fressian"
+                  (write-fressian! test)))]
        (map deref)
        dorun)
   (update-symlinks! test)
@@ -251,12 +293,37 @@
   "Phase 2: after computing results, we re-write the fressian file and also
   dump results as edn. Returns test."
   [test]
-  (->> [(future (write-results! test))
-        (future (write-fressian! test))]
+  (->> [(future (util/with-thread-name "jepsen results" (write-results! test)))
+        (future (util/with-thread-name "jepsen fressian"
+                  (write-fressian! test)))]
        (map deref)
        dorun)
   (update-symlinks! test)
   test)
+
+(def console-appender
+  {:appender :console
+   :pattern "%p\t[%t] %c: %m%n"})
+
+(defn start-logging!
+  "Starts logging to a file in the test's directory."
+  [test]
+  (unilog/start-logging!
+    {:level   "info"
+     :console   false
+     :appenders [console-appender
+                 {:appender :file
+                  :encoder :pattern
+                  :pattern "%d{ISO8601}{GMT}\t%p\t[%t] %c: %m%n"
+                  :file (.getCanonicalPath (path! test "jepsen.log"))}]}))
+
+(defn stop-logging!
+  "Resets logging to console only."
+  []
+  (unilog/start-logging!
+    {:level "info"
+     :console   false
+     :appenders [console-appender]}))
 
 (defn delete-file-recursively!
   [^File f]
